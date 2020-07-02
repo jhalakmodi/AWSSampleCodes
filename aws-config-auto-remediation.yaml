@@ -1,0 +1,138 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: Required
+        Parameters: 
+          - CentralizedS3BucketConfigFullName
+          - ComplianceAccountId
+          - ConfigRoleName
+Parameters:
+  CentralizedS3BucketConfigFullName:
+    ConstraintDescription: Enter DNS-compliant name
+    Description: Bucket name where Config logs are centrally stored. It is located in the Compliance Account.
+    Default: 'config-logs'
+    Type: String
+  ComplianceAccountId:
+    ConstraintDescription: 12 digits, no dashes
+    Description: Account ID of the Compliance Account. The compliance-as-code engine must be installed in this account first.
+    Default: '123456789012'
+    Type: String
+  ConfigRoleName:
+    Description: Role Name of the Compliance Account Cross Account Role
+    Default: "ConfigurationRecorder_RL"
+    Type: String
+Resources:
+  ConfigBucket:
+    DeletionPolicy: Retain
+    Type: AWS::S3:BucketPolicy
+    Properties:
+      BucketName: !Ref CentralizedS3BucketConfigFullName
+
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CentralizedS3BucketConfigFullName
+      PolicyDocument:
+        Version:
+        Statement:
+          - Sid: AWSConfigBucketPermissionCheck
+            Effect: Allow
+            Principal:
+              Service: config:config.amazonaws.com
+            Action: S3:GetBucketAcl
+            Resource: !Sub "arn:aws:s3:::${CentralizedS3BucketConfigFullName}"
+          - Sid: AWSConfigBucketDelivery
+            Effect: Allow
+            Principal:
+              Service: config:config.amazonaws.com
+            Action: S3:PutObject
+            Resource: 
+              - !Sub 'arn:aws:s3:::${CentralizedS3BucketConfigFullName}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+
+  AggregationAuthorization: 
+    Type: "AWS::Config::AggregationAuthorization"
+    Properties: 
+      AuthorizedAccountId: !Ref ComplianceAccountId
+      AuthorizedAwsRegion: !Ref 'AWS::Region'
+
+  AWSConfigRecorderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Action:
+          - sts:AssumeRole
+          Principal:
+            Service: config.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/service-role/AWSConfigRole'
+      RoleName: !Ref ConfigRoleName
+
+  AWSConfigRulePublicReadProhibited:
+    Type: 'AWS::Config::ConfigRule'
+    Properties:
+      ConfigRuleName: 's3-bucket-public-read-prohibited'
+      Description: >-
+        Checks that your S3 buckets do not allow public read access. If an S3
+        bucket policy or bucket ACL allows public read access, the bucket is
+        noncompliant.
+      InputParameters: {}
+      Scope:
+        ComplianceResourceTypes:
+          - 'AWS::S3::Bucket'
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_READ_PROHIBITED
+    DependsOn:
+    - ConfigurationRecorder
+    - DeliveryChannel
+
+  BasicRemediationConfiguration:
+    DependsOn: AWSConfigRulePublicReadProhibited
+    Type: "AWS::Config::RemediationConfiguration"
+    Properties:
+      ConfigRuleName: !Ref AWSConfigRulePublicReadProhibited
+      ResourceType: "AWS::S3::Bucket"
+      TargetType: "SSM_DOCUMENT"
+      TargetId: "AWS-DisableS3BucketPublicReadWrite"
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values: []
+        S3BucketName:
+          ResourceValue:
+            Value: "RESOURCE_ID"
+      TargetVersion: "1"
+      Automatic: True
+      MaximumAutomaticAttempts: 5
+      RetryAttemptSeconds: 60
+
+  ConfigurationRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      RecordingGroup:
+        AllSupported: 'True'
+        IncludeGlobalResourceTypes: 'True'
+      RoleARN: !GetAtt AWSConfigRecorderRole.Arn
+    DependsOn:
+    - AWSConfigRecorderRole
+    - ConfigBucketPolicy
+
+  DeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: Six_Hours
+      S3BucketName: !Ref CentralizedS3BucketConfigFullName
+      Name: default
+    DependsOn:
+    - ConfigBucketPolicy
